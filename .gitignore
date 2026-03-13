@@ -1,0 +1,13 @@
+# python cache
+__pycache__/
+
+# checkpoints
+.ipynb_checkpoints/
+checkpoints/
+
+# vscode
+.vscode/
+
+# train data
+heatmaps/
+logs/
