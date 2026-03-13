@@ -9,7 +9,7 @@ import logging
 import time
 
 from dataset import GenADDataset
-from model import PerStepGuidedDiffFlowAD
+from model_idea1_heuristic import PerStepGuidedDiffFlowAD
 from model_idea2_ode import ProbabilityFlowODE_AD
 from model_idea3_cascade import FeatureCascadedAD
 from utils import compute_image_auroc, compute_pixel_auroc, save_anomaly_heatmap
@@ -64,18 +64,26 @@ def test():
     meta_file = c_data.get('meta_file', None)
     
     batch_size = c_train.get('batch_size', 8)
-    log_dir = c_train.get('log_dir', './logs')
     device = c_train.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
 
     n_steps = c_model.get('n_steps', 50)
     guidance_scale = c_model.get('guidance_scale', 0.1)
     model_type = c_model.get('model_type', 'idea1')
 
-    save_heatmaps = c_test.get('save_heatmaps', False)
-    heatmap_dir = c_test.get('heatmap_dir', './heatmaps')
     save_cat_name = category if isinstance(category, str) else "multi_class"
+    if save_cat_name == 'all': save_cat_name = "all_class"
+
+    # 动态创建按时间戳划分的独立测试结果目录
+    run_timestamp = time.strftime('%Y%m%d_%H%M%S')
+    results_base_dir = c_test.get('results_dir', './results')
+    run_dir = os.path.join(results_base_dir, f"test_{save_cat_name}_{run_timestamp}")
+    
+    log_dir = os.path.join(run_dir, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    save_heatmaps = c_test.get('save_heatmaps', False)
     if save_heatmaps:
-        heatmap_dir = os.path.join(heatmap_dir, save_cat_name)
+        heatmap_dir = os.path.join(run_dir, 'heatmaps', save_cat_name)
         os.makedirs(heatmap_dir, exist_ok=True)
 
     logger = setup_logger(log_dir, category)
@@ -83,6 +91,7 @@ def test():
     logger.info(f"=== 启动 DiffFlow 独立测试 ===")
     logger.info(f"Dataset: {dataset_path} [{dataset_type}] | Category: {category} | Device: {device} | Model: {model_type}")
     logger.info(f"Loading checkpoint: {args.checkpoint}")
+    logger.info(f"Results will be saved to: {run_dir}")
 
     # 1. 准备数据(只加载测试集)
     test_dataset = GenADDataset(dataset_path, category, dataset_type=dataset_type, is_train=False, meta_file=meta_file)

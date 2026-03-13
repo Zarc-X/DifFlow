@@ -10,7 +10,7 @@ import logging
 import time
 
 from dataset import GenADDataset
-from model import PerStepGuidedDiffFlowAD
+from model_idea1_heuristic import PerStepGuidedDiffFlowAD
 from model_idea2_ode import ProbabilityFlowODE_AD
 from model_idea3_cascade import FeatureCascadedAD
 from utils import compute_image_auroc, compute_pixel_auroc, normalize_anomaly_map
@@ -66,23 +66,32 @@ def train():
     batch_size = c_train.get('batch_size', 8)
     lr = c_train.get('lr', 2e-4)
     lambda_flow = c_train.get('lambda_flow', 1.0)
-    save_dir = c_train.get('save_dir', './checkpoints')
-    log_dir = c_train.get('log_dir', './logs')
     device = c_train.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
 
     n_steps = c_model.get('n_steps', 50)
     guidance_scale = c_model.get('guidance_scale', 0.1)
     model_type = c_model.get('model_type', 'idea1')
 
+    # 对于展示目的，如果 category 是列表或者 all，将其简写保存
+    save_cat_name = category if isinstance(category, str) else "multi_class"
+    if save_cat_name == 'all': save_cat_name = "all_class"
+
+    # 动态创建按时间戳划分的独立结果目录
+    run_timestamp = time.strftime('%Y%m%d_%H%M%S')
+    results_base_dir = c_train.get('results_dir', './results')
+    run_dir = os.path.join(results_base_dir, f"train_{save_cat_name}_{run_timestamp}")
+    
+    save_dir = os.path.join(run_dir, 'checkpoints')
+    log_dir = os.path.join(run_dir, 'logs')
+    
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
     logger = setup_logger(log_dir, category)
 
     logger.info(f"=== 启动 DiffFlow 训练 ===")
     logger.info(f"Dataset: {dataset_path} [{dataset_type}] | Category: {category} | Device: {device} | Model: {model_type}")
-
-    # 对于展示目的，如果 category 是列表或者 all，将其简写保存
-    save_cat_name = category if isinstance(category, str) else "multi_class"
-    if save_cat_name == 'all': save_cat_name = "all_class"
+    logger.info(f"Results will be saved to: {run_dir}")
 
     # 1. 准备数据
     train_dataset = GenADDataset(dataset_path, category, dataset_type=dataset_type, is_train=True, meta_file=meta_file)

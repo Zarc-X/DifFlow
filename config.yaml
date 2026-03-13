@@ -16,10 +16,9 @@ train:
   batch_size: 32
   lr: 0.0002
   lambda_flow: 1.0    # Flow损失的权重
-  save_dir: "./checkpoints"
-  log_dir: "./logs"   # 日志保存路径
+  results_dir: "./results" # 所有训练输出结果保存根目录
   device: "cuda"      # 运行设备 cuda 或 cpu
 
 test:
   save_heatmaps: true
-  heatmap_dir: "./heatmaps"
+  results_dir: "./results" # 所有测试输出结果保存根目录

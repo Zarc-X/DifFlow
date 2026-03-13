@@ -17,27 +17,40 @@ import torch.nn.functional as F
 """
 
 class DiffUNet(nn.Module):
-    def __init__(self, channels=3):
+    def __init__(self, channels=3, base_dim=64):
         super().__init__()
-        # 简化版U-Net，输入通道包含图像和时间步t
-        self.conv = nn.Conv2d(channels + 1, channels, 3, padding=1)
-        
+        # 简单可运行的U-Net用于演示和跑库验证。实际工业落地请换成DDPM中的标准UNet架构
+        self.enc1 = nn.Conv2d(channels + 1, base_dim, 3, padding=1)
+        self.enc2 = nn.Conv2d(base_dim, base_dim*2, 3, stride=2, padding=1)
+        self.dec2 = nn.ConvTranspose2d(base_dim*2, base_dim, 4, stride=2, padding=1)
+        self.dec1 = nn.Conv2d(base_dim * 2, channels, 3, padding=1)
+
     def forward(self, x, t):
-        # 扩展t以匹配空间维度，拼接到通道中
+        # 将 t 扩展拼接进入特征
         t_expand = t.view(-1, 1, 1, 1).expand(x.shape[0], 1, x.shape[2], x.shape[3])
-        x_t = torch.cat([x, t_expand], dim=1)
-        # 预测加在图像上的噪声 (noise residual)
-        return self.conv(x_t)
+        x_in = torch.cat([x, t_expand], dim=1)
+        
+        e1 = F.relu(self.enc1(x_in))
+        e2 = F.relu(self.enc2(e1))
+        d2 = F.relu(self.dec2(e2))
+        
+        d1 = self.dec1(torch.cat([e1, d2], dim=1))
+        return d1
 
 class FlowLikelihoodEstimator(nn.Module):
     def __init__(self, channels=3):
         super().__init__()
-        # Normalizing Flow 模拟结构，用于算密度
-        self.flow_layer = nn.Conv2d(channels, channels, 1) 
+        # 简单模拟 Normalizing Flow (RealNVP/Glow 等)。工业应用请使用 msflow 中的 Freia 块。
+        self.flow_layer = nn.Sequential(
+            nn.Conv2d(channels, 64, 1),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(64, channels, 1)
+        )
         
     def forward(self, x):
-        # 模拟 Flow 前向传播，输出高斯隐变量 z 和 雅可比对数行列式 log_det
+        # 伪装 Flow 的对数似然计算：假设隐变量z符合标准正态分布，并粗略近似雅可比矩阵
         z = self.flow_layer(x)
+        # 用常数或近似项模拟log_det_jacobian
         log_det = torch.zeros(x.shape[0], device=x.device) 
         log_p_z = -0.5 * torch.sum(z**2, dim=1, keepdim=True) 
         log_likelihood = log_p_z + log_det.view(-1, 1, 1, 1)
@@ -46,66 +59,80 @@ class FlowLikelihoodEstimator(nn.Module):
 class PerStepGuidedDiffFlowAD(nn.Module):
     def __init__(self, channels=3, guidance_scale=0.1, n_steps=50):
         super().__init__()
-        self.unet = DiffUNet(channels)
-        self.flow_model = FlowLikelihoodEstimator(channels)
+        self.unet = DiffUNet(channels=channels)
+        self.flow_model = FlowLikelihoodEstimator(channels=channels)
         self.guidance_scale = guidance_scale
         self.n_steps = n_steps
         
-    def forward(self, x_orig):
+    def forward_train(self, x_0):
         """
-        前向推理（测试阶段定位异常）
-        x_orig: [B, C, H, W] 待测试原图
+        训练阶段：分别计算 Diffusion 的去噪MSE损失，以及 Flow 的对数似然损失
+        """
+        device = x_0.device
+        batch_size = x_0.shape[0]
+        
+        # ------------------
+        # 1. Diffusion Loss
+        # ------------------
+        # 随机采样时间步 [0, n_steps-1]
+        t = torch.randint(0, self.n_steps, (batch_size,), device=device).float()
+        noise = torch.randn_like(x_0)
+        
+        # 为了演示，此处采用简化的纯线性加噪（真实场景请使用 DDPM 的 alpha/beta 调度机制）
+        alpha_t = 1.0 - (t / self.n_steps)
+        alpha_t = alpha_t.view(-1, 1, 1, 1)
+        x_noisy = alpha_t * x_0 + (1 - alpha_t) * noise
+        
+        pred_noise = self.unet(x_noisy, t)
+        loss_diff = F.mse_loss(pred_noise, noise)
+        
+        # ------------------
+        # 2. Flow Loss
+        # ------------------
+        # 训练 Flow 拟合原图(正常纯净样本)的概率密度 (Max Likelihood 视角)
+        log_p = self.flow_model(x_0)
+        loss_flow = -torch.mean(log_p)  # 最小化负对数似然
+        
+        return loss_diff, loss_flow
+
+    def forward_test(self, x_orig):
+        """
+        测试阶段：推理获取 Anomaly Score Map (利用Flow引力梯度引导)
         """
         batch_size = x_orig.shape[0]
         device = x_orig.device
         
-        # --- 步骤1：前向加噪 ---
-        # 加入微量或中等噪声，抹去高频的异常细节
-        t_start = torch.tensor([self.n_steps], device=device, dtype=torch.float32)
+        t_start = torch.tensor([self.n_steps-1] * batch_size, device=device, dtype=torch.float32)
         noise = torch.randn_like(x_orig)
-        # 简化的线性加噪
-        x_t = x_orig + noise * 0.5 
+        x_t = x_orig * 0.5 + noise * 0.5 # 适度加噪破坏异常，不建议毁到全噪
         
-        # 累积异常偏差图 (Accumulated Anomaly Guidance)
         anomaly_score_map = torch.zeros(batch_size, 1, x_orig.shape[2], x_orig.shape[3], device=device)
         
-        # --- 步骤2：反向联合去噪 (Flow 引导 Diffusion) ---
         for i in reversed(range(self.n_steps)):
-            t = torch.tensor([i], device=device, dtype=torch.float32)
+            t = torch.tensor([i] * batch_size, device=device, dtype=torch.float32)
             
-            # --- 2.1 获取 Flow 的引力梯度 ---
-            # 必须使得输入 Tensor 持有梯度
+            # --- Flow 引力梯度引导 ---
             x_t.requires_grad_(True)
             log_p_xt = self.flow_model(x_t)
-            
-            # 对 log_likelihood 求总和标量后，向输入 x_t 求偏导
             log_p_xt_sum = log_p_xt.sum()
             grad_flow = torch.autograd.grad(log_p_xt_sum, x_t)[0] 
-            
-            # 及时detach x_t 避免计算图无限增长
             x_t = x_t.detach()
             
-            # --- 2.2 获取 Diffusion 预测的基础去噪方向 ---
+            # --- Diffusion 去噪预测 ---
             pred_noise = self.unet(x_t, t)
             
-            # --- 2.3 融合：步进更新 ---
-            # 经典的去噪步骤 (这里用类似 DDIM 的简化后退)
+            # --- 更新融合 ---
             dt = 1.0 / self.n_steps
-            # 基础更新 (走向 x_0)
             dx_diffusion = - pred_noise * dt 
-            # Flow引导更新 (走向密集的正常工业件分布)
             dx_flow = self.guidance_scale * grad_flow * dt
             
             x_t = x_t + dx_diffusion + dx_flow
             
-            # --- 2.4 异常得分累积 ---
-            # 核心思想：正常区域，Diffusion就能去噪好，Flow给的修偏梯度很小。
-            # 异常区域，Flow觉得非常“碍眼”，使得 grad_flow 模长在这里特别大。
-            # 我们累积 Flow 在这整个去噪过程中，做出的“纠正努力强度”来作为异常得分。
+            # --- 累积异常得分 ---
             anomaly_score_map += torch.norm(grad_flow, dim=1, keepdim=True) * dt
-        
-        # 此时的 x_t 是重建完毕的近似正常图像，也可以额外叠加重建误差
+            
         reconstruction_error = torch.mean((x_orig - x_t)**2, dim=1, keepdim=True)
         final_anomaly_map = anomaly_score_map + reconstruction_error
         
         return final_anomaly_map, x_t
+
