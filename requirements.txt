@@ -1,0 +1,19 @@
+# PyTorch
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Core Machine Learning & Data Processing
+numpy>=1.24.0
+scikit-learn>=1.2.0
+scipy>=1.10.0
+
+# Image Processing
+Pillow>=9.5.0
+
+# Normalizing Flows
+FrEIA>=0.2
+
+# Utilities
+tqdm>=4.65.0
+PyYAML>=6.0
+matplotlib>=3.7.0

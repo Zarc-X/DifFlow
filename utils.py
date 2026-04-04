@@ -7,7 +7,13 @@ def compute_image_auroc(image_scores, image_labels):
     """
     计算图片级 AUROC
     """
-    return roc_auc_score(image_labels, image_scores)
+    try:
+        # 清理异常值，防止偶尔由于模型导致出现 NaN/Inf 从而报错
+        image_scores = np.nan_to_num(np.array(image_scores))
+        return roc_auc_score(image_labels, image_scores)
+    except ValueError:
+        # 当标签中只包含一类（如全为0 或全为1）时，计算会报错，返回0.0处理
+        return 0.0
 
 def compute_pixel_auroc(pixel_scores, pixel_masks):
     """
@@ -15,7 +21,24 @@ def compute_pixel_auroc(pixel_scores, pixel_masks):
     """
     pixel_scores = pixel_scores.flatten()
     pixel_masks = pixel_masks.flatten()
-    return roc_auc_score(pixel_masks, pixel_scores)
+    
+    # 确立安全的二值掩码 (0或1)，即使原图是 255 插值后的偶尔浮点数
+    pixel_masks = (pixel_masks > 0.5).astype(int)
+    
+    # 清理偶尔产生的 NaN / Inf 异常特征得分
+    pixel_scores = np.nan_to_num(pixel_scores)
+    
+    # 防止显存或内存不足，如果数据量极其巨大（如多类全量混训验证），可以取下采样
+    if len(pixel_scores) > 100000000: # 超过1亿像素点（约1500张图）时随机下采样计算
+        np.random.seed(42)
+        indices = np.random.choice(len(pixel_scores), 100000000, replace=False)
+        pixel_scores = pixel_scores[indices]
+        pixel_masks = pixel_masks[indices]
+        
+    try:
+        return roc_auc_score(pixel_masks, pixel_scores)
+    except ValueError:
+        return 0.0
 
 def compute_pro(anomaly_maps, ground_truth_maps, max_step=200):
     """

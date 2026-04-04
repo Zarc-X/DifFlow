@@ -10,9 +10,11 @@ import logging
 import time
 
 from dataset import GenADDataset
-from model_idea1_heuristic import PerStepGuidedDiffFlowAD
-from model_idea2_ode import ProbabilityFlowODE_AD
-from model_idea3_cascade import FeatureCascadedAD
+from models.idea1_heuristic import PerStepGuidedDiffFlowAD
+from models.idea2_ode import ProbabilityFlowODE_AD
+from models.idea3_cascade import FeatureCascadedAD
+from models.idea4_simple import SimpleGuidedDiffFlowAD
+from models.idea5_msflow_diffusion import DiffusionMSFlowAD
 from utils import compute_image_auroc, compute_pixel_auroc, normalize_anomaly_map
 
 def parse_args():
@@ -27,9 +29,13 @@ def load_config(config_path):
 def setup_logger(log_dir, category):
     os.makedirs(log_dir, exist_ok=True)
     save_cat = category if isinstance(category, str) else "multi"
-    log_file = os.path.join(log_dir, f"train_{save_cat}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    log_file = os.path.join(log_dir, f"train_{save_cat}.log")
     
+    # 避免多个类别训练时日志处理器重复累加，每次清空之前的handlers
     logger = logging.getLogger('DiffFlow')
+    if logger.hasHandlers():
+        logger.handlers.clear()
+        
     logger.setLevel(logging.INFO)
     
     # 文件处理器 (写入到文件)
@@ -46,19 +52,20 @@ def setup_logger(log_dir, category):
     
     logger.addHandler(fh)
     logger.addHandler(ch)
+    
+    # 防止日志向上传递到 root logger 造成可能的双重打印
+    logger.propagate = False 
+    
     return logger
 
-def train():
-    args = parse_args()
-    config = load_config(args.config)
-    
+def train_category(args, config, category_name, run_timestamp):
     # 解析配置
     c_data = config.get('dataset', {})
     c_model = config.get('model', {})
     c_train = config.get('train', {})
 
     dataset_path = c_data.get('dataset_path', '/root/autodl-tmp/mvtec_anomaly_detection')
-    category = c_data.get('category', 'hazelnut')
+    category = category_name  # 使用传入的单一类别
     dataset_type = c_data.get('dataset_type', 'mvtec')
     meta_file = c_data.get('meta_file', None)
     
@@ -72,20 +79,22 @@ def train():
     guidance_scale = c_model.get('guidance_scale', 0.1)
     model_type = c_model.get('model_type', 'idea1')
 
-    # 对于展示目的，如果 category 是列表或者 all，将其简写保存
     save_cat_name = category if isinstance(category, str) else "multi_class"
-    if save_cat_name == 'all': save_cat_name = "all_class"
 
-    # 动态创建按时间戳划分的独立结果目录
-    run_timestamp = time.strftime('%Y%m%d_%H%M%S')
+    # 新的结果层级结构: ./results/{run_timestamp}/{category}/
     results_base_dir = c_train.get('results_dir', './results')
-    run_dir = os.path.join(results_base_dir, f"train_{save_cat_name}_{run_timestamp}")
+    run_dir = os.path.join(results_base_dir, f"run_{run_timestamp}", save_cat_name)
     
     save_dir = os.path.join(run_dir, 'checkpoints')
     log_dir = os.path.join(run_dir, 'logs')
     
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
+    
+    # 保存本次训练的配置参数
+    config_save_path = os.path.join(run_dir, 'config.yaml')
+    with open(config_save_path, 'w', encoding='utf-8') as f:
+        yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
 
     logger = setup_logger(log_dir, category)
 
@@ -108,6 +117,11 @@ def train():
         model.n_steps = n_steps
     elif model_type == 'idea3':
         model = FeatureCascadedAD().to(device)
+    elif model_type == 'idea4':
+        model = SimpleGuidedDiffFlowAD(channels=3, guidance_scale=guidance_scale, n_steps=n_steps).to(device)
+    elif config['model']['model_type'] == 'idea5':
+        from models.idea5_msflow_diffusion import DiffusionMSFlowAD
+        model = DiffusionMSFlowAD(channels=3, n_steps=config['model'].get('n_steps', 1000)).to(device)
     else:
         raise ValueError(f"不支持的 model_type: {model_type}")
         
@@ -164,8 +178,30 @@ def train():
                 anomaly_maps_np = anomaly_maps.cpu().detach().numpy()
                 masks_np = masks.numpy()
                 
-                # 图像级别的得分可以简单取热力图最大值或均值
-                image_scores = anomaly_maps_np.reshape(anomaly_maps_np.shape[0], -1).max(axis=1)
+                # 【核心修复】：为异常预测图添加高斯平滑滤波（工业缺陷检测标准流程）。
+                # MSFlow、FastFlow 等必须依靠平滑来消除由 CNN 或边缘 Padding 产生的孤立极高噪点，
+                # 否则会导致后续取 max 作为 image score 时，正常图片也被误判为极高分。
+                from scipy.ndimage import gaussian_filter
+                for i in range(anomaly_maps_np.shape[0]):
+                    # 动态选择后处理模糊强度：idea4 为像素级高频重构误差，只需极小的 sigma 去噪；其他特征级模型需要强平滑
+                    if config['model']['model_type'] == 'idea4':
+                        anomaly_maps_np[i, 0] = gaussian_filter(anomaly_maps_np[i, 0], sigma=1)
+                    else:
+                        anomaly_maps_np[i, 0] = gaussian_filter(anomaly_maps_np[i, 0], sigma=4)
+                    
+                    # 在最后一个 Epoch，保存热力图用于可视化验证
+                    if epoch == epochs:
+                        from utils import save_anomaly_heatmap
+                        hm_save_dir = os.path.join(run_dir, 'heatmaps')
+                        save_anomaly_heatmap(img_paths[i], anomaly_maps_np[i, 0], hm_save_dir)
+                
+                # 图像级别的得分不能粗暴取绝对最大值 max()
+                # 因为在卷积网络中，边缘 Padding 必然会产生极个别畸高的噪点，导致不论是正常图还是带瑕图，max 值全都极高，这也正是为何 Image AUROC 死活上不去的原因。
+                # 【优化修复】：我们改取每张图中最高得分的前 100 个像素的均值（Top-K Mean），这能在过滤噪点的同时，充分响应真实块状缺陷。
+                flatten_maps = anomaly_maps_np.reshape(anomaly_maps_np.shape[0], -1)
+                flatten_maps.sort(axis=1)
+                k = min(100, flatten_maps.shape[1])
+                image_scores = flatten_maps[:, -k:].mean(axis=1)
                 
                 all_img_scores.extend(image_scores)
                 all_img_labels.extend(labels.numpy())
@@ -193,6 +229,50 @@ def train():
                 save_path = os.path.join(save_dir, f'difflow_best_{save_cat_name}.pt')
                 torch.save(model.state_dict(), save_path)
                 logger.info(f"已保存最佳模型至: {save_path}")
+                
+            if epoch == epochs:
+                save_path_last = os.path.join(save_dir, f'difflow_last_{save_cat_name}.pt')
+                torch.save(model.state_dict(), save_path_last)
+                logger.info(f"已保存最终 Epoch 模型至: {save_path_last}")
+
+    # ==========================
+    # 防止多类别循环训练时导致 OOM
+    # 释放当前类别的模型及数据缓存
+    # ==========================
+    try:
+        del model, optimizer, train_loader, test_loader
+    except NameError:
+        pass
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+    
+    # 每次运行 train.py 生成一个统一时间的运行批次标识
+    run_timestamp = time.strftime('%Y%m%d_%H%M%S')
+    
+    c_data = config.get('dataset', {})
+    categories = c_data.get('category', 'hazelnut')
+    
+    if isinstance(categories, list):
+        for cat in categories:
+            print(f"\n{'='*50}\n>>> 开始独立类别模型训练: {cat} <<<\n{'='*50}")
+            train_category(args, config, cat, run_timestamp)
+    elif categories == 'all':
+        dataset_path = c_data.get('dataset_path', '/root/autodl-tmp/mvtec_anomaly_detection')
+        if os.path.exists(dataset_path):
+            all_cats = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))]
+            for cat in all_cats:
+                print(f"\n{'='*50}\n>>> 开始独立类别模型训练: {cat} <<<\n{'='*50}")
+                train_category(args, config, cat, run_timestamp)
+        else:
+            print(f"数据集目录不存在: {dataset_path}")
+    else:
+        print(f"\n{'='*50}\n>>> 开始独立类别模型训练: {categories} <<<\n{'='*50}")
+        train_category(args, config, categories, run_timestamp)
 
 if __name__ == '__main__':
-    train()
+    main()

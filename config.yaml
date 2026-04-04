@@ -1,21 +1,20 @@
 dataset:
   dataset_path: "/root/autodl-tmp/mvtec_anomaly_detection"
-  category: ['carpet', 'grid', 'leather', 'tile', 'wood',
-                   'bottle', 'cable', 'capsule', 'hazelnut', 'metal_nut', 'pill',
-                   'screw', 'toothbrush', 'transistor', 'zipper']
+  category: ['bottle', 'cable', 'capsule', 'carpet', 'grid', 'hazelnut', 'leather', 'metal_nut', 'pill', 'screw', 'tile', 'toothbrush', 'transistor', 'wood', 'zipper']
+
   dataset_type: "mvtec"
   meta_file: null     # Real-IAD的jsonl文件路径，默认为空
 
 model:
-  model_type: "idea3" # 可选: idea1 (PerStepGuidedDiffFlow), idea2 (ProbabilityFlowODE), idea3 (FeatureCascaded)
-  n_steps: 50
+  model_type: "idea5" # 可选: idea1 (PerStepGuidedDiffFlow), idea2 (ProbabilityFlowODE), idea3 (FeatureCascaded)
+  n_steps: 400
   guidance_scale: 0.1
 
 train:
-  epochs: 100
-  batch_size: 32
+  epochs: 50
+  batch_size: 4
   lr: 0.0002
-  lambda_flow: 1.0    # Flow损失的权重
+  lambda_flow: 0.01    # Flow损失的权重
   results_dir: "./results" # 所有训练输出结果保存根目录
   device: "cuda"      # 运行设备 cuda 或 cpu
 
