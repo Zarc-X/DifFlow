@@ -122,6 +122,9 @@ def train_category(args, config, category_name, run_timestamp):
     elif config['model']['model_type'] == 'idea5':
         from models.idea5_msflow_diffusion import DiffusionMSFlowAD
         model = DiffusionMSFlowAD(channels=3, n_steps=config['model'].get('n_steps', 1000)).to(device)
+    elif config['model']['model_type'] == 'idea6':
+        from models.idea6_decoupled import DecoupledDiffFlowAD
+        model = DecoupledDiffFlowAD(channels=3, n_steps=config['model'].get('n_steps', 1000)).to(device)
     else:
         raise ValueError(f"不支持的 model_type: {model_type}")
         
@@ -141,7 +144,10 @@ def train_category(args, config, category_name, run_timestamp):
             optimizer.zero_grad()
             
             # 获取训练Loss: Diffusion(MSE) 和 Flow(-LogP)
-            loss_diff, loss_flow = model.forward_train(imgs)
+            if config['model']['model_type'] == 'idea6':
+                loss_diff, loss_flow = model.forward_train(imgs, epoch=epoch)
+            else:
+                loss_diff, loss_flow = model.forward_train(imgs)
             loss = loss_diff + lambda_flow * loss_flow
             
             loss.backward()
@@ -198,8 +204,8 @@ def train_category(args, config, category_name, run_timestamp):
                 # 图像级别的得分不能粗暴取绝对最大值 max()
                 # 因为在卷积网络中，边缘 Padding 必然会产生极个别畸高的噪点，导致不论是正常图还是带瑕图，max 值全都极高，这也正是为何 Image AUROC 死活上不去的原因。
                 # 【优化修复】：我们改取每张图中最高得分的前 100 个像素的均值（Top-K Mean），这能在过滤噪点的同时，充分响应真实块状缺陷。
-                flatten_maps = anomaly_maps_np.reshape(anomaly_maps_np.shape[0], -1)
-                flatten_maps.sort(axis=1)
+                flatten_maps = np.sort(anomaly_maps_np.reshape(anomaly_maps_np.shape[0], -1), axis=1)
+                
                 k = min(100, flatten_maps.shape[1])
                 image_scores = flatten_maps[:, -k:].mean(axis=1)
                 
