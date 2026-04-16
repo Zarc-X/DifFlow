@@ -1,19 +1,18 @@
 dataset:
   dataset_path: "/root/autodl-tmp/mvtec_anomaly_detection"
-  category: ['carpet', 'grid', 'leather', 'tile', 'wood',
-                   'bottle', 'cable', 'capsule', 'hazelnut', 'metal_nut', 'pill',
+  category: ['metal_nut', 'pill',
                    'screw', 'toothbrush', 'transistor', 'zipper']
   dataset_type: "mvtec"
   meta_file: null     # Real-IAD的jsonl文件路径，默认为空
 
 model:
-  model_type: "idea6" # 解耦分离训练架构：Diffusion(特征抗噪) + 自适应级联Flow
+  model_type: "idea7" # 解耦分离训练架构：Diffusion(特征抗噪) + 自适应级联Flow
   n_steps: 400
   guidance_scale: 0.1
 
 train:
-  epochs: 50
-  batch_size: 128
+  epochs: 250
+  batch_size: 4
   lr: 0.0002
   lambda_flow: 1.0    # Flow损失的权重
   results_dir: "./results" # 所有训练输出结果保存根目录

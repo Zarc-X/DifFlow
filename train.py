@@ -15,7 +15,7 @@ from models.idea2_ode import ProbabilityFlowODE_AD
 from models.idea3_cascade import FeatureCascadedAD
 from models.idea4_simple import SimpleGuidedDiffFlowAD
 from models.idea5_msflow_diffusion import DiffusionMSFlowAD
-from utils import compute_image_auroc, compute_pixel_auroc, normalize_anomaly_map
+from utils import compute_image_auroc, compute_pixel_auroc, compute_best_f1, compute_average_precision, normalize_anomaly_map
 
 def parse_args():
     parser = argparse.ArgumentParser(description='DiffFlow for Anomaly Detection')
@@ -122,7 +122,10 @@ def train_category(args, config, category_name, run_timestamp):
     elif config['model']['model_type'] == 'idea5':
         from models.idea5_msflow_diffusion import DiffusionMSFlowAD
         model = DiffusionMSFlowAD(channels=3, n_steps=config['model'].get('n_steps', 1000)).to(device)
-    elif config['model']['model_type'] == 'idea6':
+    elif config['model']['model_type'] == 'idea7':
+        from models.idea7_diffusion_flow import DiffusionFlowAD
+        model = DiffusionFlowAD(channels=3, n_steps=config['model'].get('n_steps', 1000)).to(device)
+    elif config['model']['model_type'] in ['idea6', 'idea7']:
         from models.idea6_decoupled import DecoupledDiffFlowAD
         model = DecoupledDiffFlowAD(channels=3, n_steps=config['model'].get('n_steps', 1000)).to(device)
     else:
@@ -144,7 +147,7 @@ def train_category(args, config, category_name, run_timestamp):
             optimizer.zero_grad()
             
             # 获取训练Loss: Diffusion(MSE) 和 Flow(-LogP)
-            if config['model']['model_type'] == 'idea6':
+            if config['model']['model_type'] in ['idea6', 'idea7']:
                 loss_diff, loss_flow = model.forward_train(imgs, epoch=epoch)
             else:
                 loss_diff, loss_flow = model.forward_train(imgs)
@@ -159,7 +162,7 @@ def train_category(args, config, category_name, run_timestamp):
             pbar.set_postfix({'L_Diff': total_loss_diff/len(train_loader), 'L_Flow': total_loss_flow/len(train_loader)})
 
         # 4. 评估验证循环 (每 5 个 Epoch 验证一次以节省时间)
-        if epoch % 5 == 0 or epoch == epochs:
+        if epoch % 10 == 0 or epoch == epochs:
             model.eval()
             all_img_scores = []
             all_img_labels = []
@@ -173,19 +176,47 @@ def train_category(args, config, category_name, run_timestamp):
             
             # 【重要】为了使 Flow 向图像求偏导生效，测试时不能将包裹在外层的 with torch.no_grad() 写死
             # 下方采取手动管理 grad
+            
+            # --- 加入工业界标准 PyTorch 测速 (CUDA Event) ---
+            starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            timings = []
+            
             pbar_test = tqdm(test_loader, desc=f"Epoch {epoch} [Test]")
-            for imgs, labels, masks, img_paths in pbar_test:
+            for step, (imgs, labels, masks, img_paths) in enumerate(pbar_test):
                 imgs = imgs.to(device)
                 
-                # 调用引导推理过程 (内部具有 grad 计算)
-                anomaly_maps, _ = model.forward_test(imgs)
+                # 开始记录推理时间（GPU计算起步）
+                starter.record()
+                
+                # 核心推理代码（这部分耗时将直接反映给用户）
+                with torch.no_grad(): # 确认idea7等纯前向架构不需要推理回传，可以直接使用no_grad加速
+                    anomaly_maps, recon_imgs = model.forward_test(imgs)
+                
+                # 记录推理结束并等待所有 CUDA 核心执行流完成
+                ender.record()
+                torch.cuda.synchronize()
+                
+                # 第一步 (step == 0) GPU 会有加载核函数的 Warm-up 延迟，不计入测速
+                if step > 0:
+                    curr_time_ms = starter.elapsed_time(ender)
+                    # 将时间均摊到 batch size 的那张图片上
+                    timings.append(curr_time_ms / imgs.shape[0])
                 
                 # 处理为numpy
                 anomaly_maps_np = anomaly_maps.cpu().detach().numpy()
+                recon_imgs_np = recon_imgs.cpu().detach().numpy() if recon_imgs is not None else None
                 masks_np = masks.numpy()
                 
-                # 【核心修复】：为异常预测图添加高斯平滑滤波（工业缺陷检测标准流程）。
-                # MSFlow、FastFlow 等必须依靠平滑来消除由 CNN 或边缘 Padding 产生的孤立极高噪点，
+                # 【防污染核心屏障】：消除卷层边缘 Padding 的畸高噪点并防止其干扰 Pixel 评价以及在滤波时向内部渗透
+                for b in range(anomaly_maps_np.shape[0]):
+                    valid_min = anomaly_maps_np[b, :, 16:-16, 16:-16].min()
+                    anomaly_maps_np[b, :, :16, :] = valid_min
+                    anomaly_maps_np[b, :, -16:, :] = valid_min
+                    anomaly_maps_np[b, :, :, :16] = valid_min
+                    anomaly_maps_np[b, :, :, -16:] = valid_min
+                
+                # 【平滑处理】：为异常预测图添加高斯平滑滤波（工业缺陷检测标准流程）。
+                # MSFlow、FastFlow 等必须依靠平滑来消除由 CNN 产生的孤立极高噪点，
                 # 否则会导致后续取 max 作为 image score 时，正常图片也被误判为极高分。
                 from scipy.ndimage import gaussian_filter
                 for i in range(anomaly_maps_np.shape[0]):
@@ -199,15 +230,13 @@ def train_category(args, config, category_name, run_timestamp):
                     if epoch == epochs:
                         from utils import save_anomaly_heatmap
                         hm_save_dir = os.path.join(run_dir, 'heatmaps')
-                        save_anomaly_heatmap(img_paths[i], anomaly_maps_np[i, 0], hm_save_dir)
+                        save_anomaly_heatmap(img_paths[i], anomaly_maps_np[i, 0], hm_save_dir, recon_img=recon_imgs_np[i] if recon_imgs_np is not None else None)
                 
-                # 图像级别的得分不能粗暴取绝对最大值 max()
-                # 因为在卷积网络中，边缘 Padding 必然会产生极个别畸高的噪点，导致不论是正常图还是带瑕图，max 值全都极高，这也正是为何 Image AUROC 死活上不去的原因。
-                # 【优化修复】：我们改取每张图中最高得分的前 100 个像素的均值（Top-K Mean），这能在过滤噪点的同时，充分响应真实块状缺陷。
-                flatten_maps = np.sort(anomaly_maps_np.reshape(anomaly_maps_np.shape[0], -1), axis=1)
-                
-                k = min(100, flatten_maps.shape[1])
-                image_scores = flatten_maps[:, -k:].mean(axis=1)
+                # 图像级别的得分直接取绝对最大值 max() 会受到卷积网络边缘 Padding 产生的畸高噪点影响。
+                # 之前使用 sort 取 Top-K 依然无法避开全部受污染的边缘像素。
+                # 【最终修复】：我们通过裁剪掉边缘 16 个像素（Padding 影响区），然后再取中心有效区域的全局最大值，从而获得真正有区分度的 Image Score。
+                valid_maps = anomaly_maps_np[:, :, 16:-16, 16:-16]
+                image_scores = valid_maps.reshape(valid_maps.shape[0], -1).max(axis=1)
                 
                 all_img_scores.extend(image_scores)
                 all_img_labels.extend(labels.numpy())
@@ -220,15 +249,38 @@ def train_category(args, config, category_name, run_timestamp):
             all_pixel_masks = np.concatenate(all_pixel_masks, axis=0)
             
             img_auroc = compute_image_auroc(all_img_scores, all_img_labels)
+            img_f1 = compute_best_f1(all_img_labels, all_img_scores)
+            img_ap = compute_average_precision(all_img_labels, all_img_scores)
             
             # 使用简单的像素 AUROC (如果显存或内存爆炸，工业界通常做下采样后计算)
             # 在某些纯无掩码的数据集上可能异常，可以增加异常捕获
             try:
                 pix_auroc = compute_pixel_auroc(all_pixel_scores, all_pixel_masks)
+                
+                # 计算像素级最佳 F1 时同样需要做安全下采样
+                pm_flat = (all_pixel_masks.flatten() > 0.5).astype(int)
+                ps_flat = all_pixel_scores.flatten()
+                if len(ps_flat) > 100000000:
+                    np.random.seed(42)
+                    indices = np.random.choice(len(ps_flat), 100000000, replace=False)
+                    ps_flat = ps_flat[indices]
+                    pm_flat = pm_flat[indices]
+                pix_f1 = compute_best_f1(pm_flat, ps_flat)
+                pix_ap = compute_average_precision(pm_flat, ps_flat)
             except ValueError:
                 pix_auroc = 0.0 # 当只传入纯净样本无掩码时会抛出
+                pix_f1 = 0.0
+                pix_ap = 0.0
                 
-            logger.info(f"[Epoch {epoch} Results] Image AUROC: {img_auroc:.4f} | Pixel AUROC: {pix_auroc:.4f}")
+            # 给出最终算力性能日志
+            avg_ms = np.mean(timings) if len(timings) > 0 else 0
+            fps = 1000.0 / avg_ms if avg_ms > 0 else 0
+
+            logger.info(
+                f"[Epoch {epoch} Results] Img AUROC: {img_auroc:.4f}, Img AP: {img_ap:.4f}, Img F1: {img_f1:.4f} | "
+                f"Pix AUROC: {pix_auroc:.4f}, Pix AP: {pix_ap:.4f}, Pix F1: {pix_f1:.4f} | "
+                f"Speed: {avg_ms:.2f} ms/img ({fps:.1f} FPS)"
+            )
 
             if img_auroc > best_img_auroc:
                 best_img_auroc = img_auroc

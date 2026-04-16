@@ -1,7 +1,27 @@
 import numpy as np
 import os
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
+
+def compute_best_f1(y_true, y_score):
+    """计算最佳阈值下的 F1 分数"""
+    try:
+        y_true = np.nan_to_num(np.array(y_true))
+        y_score = np.nan_to_num(np.array(y_score))
+        precision, recall, _ = precision_recall_curve(y_true, y_score)
+        f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
+        return np.max(f1_scores)
+    except ValueError:
+        return 0.0
+
+def compute_average_precision(y_true, y_score):
+    """计算 Average Precision (AP)，用于缓解类不平衡时 F1 的误导。"""
+    try:
+        y_true = np.nan_to_num(np.array(y_true))
+        y_score = np.nan_to_num(np.array(y_score))
+        return average_precision_score(y_true, y_score)
+    except ValueError:
+        return 0.0
 
 def compute_image_auroc(image_scores, image_labels):
     """
@@ -58,10 +78,11 @@ def normalize_anomaly_map(anomaly_map):
     max_val = anomaly_map.max()
     return (anomaly_map - min_val) / (max_val - min_val + 1e-8)
 
-def save_anomaly_heatmap(img_path, anomaly_map, save_dir):
+def save_anomaly_heatmap(img_path, anomaly_map, save_dir, recon_img=None):
     """
-    将原始图片、热力图、叠加图并排保存，便于肉眼观察缺陷定位效果。
+    将原始图片、重构图（可选）、热力图、叠加图并排保存，便于肉眼观察缺陷定位效果。
     """
+    import cv2
     os.makedirs(save_dir, exist_ok=True)
     
     # 1. 提取文件名和异常分数地图
@@ -74,8 +95,8 @@ def save_anomaly_heatmap(img_path, anomaly_map, save_dir):
     if orig_img.max() > 1.0:
         orig_img = orig_img / 255.0
         
-    # 如果网络输出的尺度和原图不同 (通常都会将图resize为256)，需要用插值将图调整大小
-    # 为了直观这里直接画图时利用 imshow 的自动缩放处理。但通常可以resize保持一致。
+    # Resize orig_img to score_map dimension, dealing with overlay mismatch
+    orig_img = cv2.resize(orig_img, (score_map.shape[1], score_map.shape[0]))
     
     # 将热力图转换到色图
     cmap = plt.get_cmap('jet')
@@ -85,19 +106,35 @@ def save_anomaly_heatmap(img_path, anomaly_map, save_dir):
     # 将原图与热力图按比例叠加 (0.5透明度)
     # 由于原图和热力图分辨率可能不同，直接在这借助 plt 画出并排的图片最好
     
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    num_subplots = 3 if recon_img is None else 4
+    fig, axes = plt.subplots(1, num_subplots, figsize=(16 if recon_img is not None else 12, 4))
+    
     axes[0].imshow(orig_img)
     axes[0].set_title('Original Image')
     axes[0].axis('off')
 
-    axes[1].imshow(score_map, cmap='jet', vmin=0, vmax=1)
-    axes[1].set_title('Anomaly Heatmap')
-    axes[1].axis('off')
+    curr_idx = 1
+    if recon_img is not None:
+        # recon_img typically (3, H, W)
+        recon_vis = recon_img.transpose(1, 2, 0)
+        if recon_vis.min() < 0:
+            recon_vis = (recon_vis + 1) / 2.0
+        recon_vis = np.clip(recon_vis, 0, 1)
+        axes[curr_idx].imshow(recon_vis)
+        axes[curr_idx].set_title('U-Net Reconstructed')
+        axes[curr_idx].axis('off')
+        curr_idx += 1
 
-    axes[2].imshow(orig_img)
-    axes[2].imshow(score_map, cmap='jet', alpha=0.5, vmin=0, vmax=1)
-    axes[2].set_title('Overlay')
-    axes[2].axis('off')
+    axes[curr_idx].imshow(score_map, cmap='jet', vmin=0, vmax=1)
+    axes[curr_idx].set_title('Anomaly Heatmap')
+    axes[curr_idx].axis('off')
+
+    curr_idx += 1
+    # overlay calculation explicitly
+    axes[curr_idx].imshow(orig_img)
+    axes[curr_idx].imshow(score_map, cmap='jet', alpha=0.5, vmin=0, vmax=1)
+    axes[curr_idx].set_title('Overlay')
+    axes[curr_idx].axis('off')
 
     plt.tight_layout()
     # 根据文件夹结构保存 (如果不同标签的话)
